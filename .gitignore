@@ -1,0 +1,5 @@
+detect_radio_module/*.o
+detect_radio_module/detect_radio_module
+
+pkg/
+*.pkg.tar.xz
