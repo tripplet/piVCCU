@@ -1,9 +1,9 @@
 _pkgbase=pivccu
 pkgname=pivccu-dkms
-pkgver=2022.3.3
+pkgver=2022.4.23
 pkgrel=1
 pkgdesc="pivccu modules"
-arch=('i686' 'x86_64' 'armv7h')
+arch=('x86_64' 'armv7h' 'aarch64')
 url="https://github.com/alexreinert/piVCCU/tree/master/kernel"
 license=('GPL2')
 depends=('dkms')
