@@ -1,5 +1,5 @@
 #!/bin/bash
-PKG_BUILD=17
+PKG_BUILD=19
 
 PKG_VERSION=2.0-$PKG_BUILD
 
@@ -29,7 +29,7 @@ done
 
 cd $WORK_DIR
 
-dpkg-deb --build pivccu-modules-raspberrypi-$PKG_VERSION
+dpkg-deb --build -Zxz pivccu-modules-raspberrypi-$PKG_VERSION
 
 cp pivccu-modules-raspberrypi-*.deb $CURRENT_DIR
 

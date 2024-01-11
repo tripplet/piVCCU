@@ -1,5 +1,5 @@
 /*-----------------------------------------------------------------------------
- * Copyright (c) 2022 by Alexander Reinert
+ * Copyright (c) 2023 by Alexander Reinert
  * Author: Alexander Reinert
  * Uses parts of bcm2835_raw_uart.c. (c) 2015 by eQ-3 Entwicklung GmbH
  *
@@ -23,6 +23,11 @@
 
 #define MAX_DEVICE_TYPE_LEN 64
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0))
+  #define class_create(__owner, __class) class_create(__class)
+  #define of_modalias_node(__node, __alias, __len) of_alias_from_compatible(__node, __alias, __len)
+#endif
+
 enum generic_raw_uart_rx_flags
 {
   GENERIC_RAW_UART_RX_STATE_NONE = 0,
@@ -32,13 +37,11 @@ enum generic_raw_uart_rx_flags
   GENERIC_RAW_UART_RX_STATE_OVERRUN = 8,
 };
 
-enum generic_raw_uart_pin
+enum generic_raw_uart_led
 {
-  GENERIC_RAW_UART_PIN_BLUE = 0,
-  GENERIC_RAW_UART_PIN_GREEN = 1,
-  GENERIC_RAW_UART_PIN_RED = 2,
-  GENERIC_RAW_UART_PIN_RESET = 3,
-  GENERIC_RAW_UART_PIN_ALT_RESET = 4,
+  GENERIC_RAW_UART_LED_RED = 0,
+  GENERIC_RAW_UART_LED_GREEN = 1,
+  GENERIC_RAW_UART_LED_BLUE = 2,
 };
 
 struct generic_raw_uart
@@ -60,7 +63,7 @@ struct raw_uart_driver
   void (*tx_chars)(struct generic_raw_uart *raw_uart, unsigned char *chr, int index, int len);
   void (*stop_tx)(struct generic_raw_uart *raw_uart);
 
-  int (*get_gpio_pin_number)(struct generic_raw_uart *raw_uart, enum generic_raw_uart_pin);
+  int (*get_led_gpio_index)(struct generic_raw_uart *raw_uart, enum generic_raw_uart_led);
   int (*reset_radio_module)(struct generic_raw_uart *raw_uart);
 
   int tx_chunk_size;
@@ -82,7 +85,8 @@ struct hb_usb_device_info
   .driver_info = (kernel_ulong_t)&((struct hb_usb_device_info) { .vendorhash = (_vendorhash), .enforce_verification = _enforce_verification, .pkey = { HB_DEV_KEY _pkey } } )
 
 extern struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_uart_driver *driver, void *driver_data);
-extern int generic_raw_uart_remove(struct generic_raw_uart *raw_uart, struct device *dev, struct raw_uart_driver *driver);
+extern int generic_raw_uart_set_connection_state(struct generic_raw_uart *raw_uart, bool state);
+extern int generic_raw_uart_remove(struct generic_raw_uart *raw_uart);
 extern void generic_raw_uart_tx_queued(struct generic_raw_uart *raw_uart);
 extern void generic_raw_uart_handle_rx_char(struct generic_raw_uart *raw_uart, enum generic_raw_uart_rx_flags, unsigned char);
 extern void generic_raw_uart_rx_completed(struct generic_raw_uart *raw_uart);
@@ -117,7 +121,7 @@ extern bool generic_raw_uart_verify_dkey(struct device *dev, unsigned char *dkey
     int err;                                                                              \
     struct device *dev = &pdev->dev;                                                      \
                                                                                           \
-    err = generic_raw_uart_remove(__raw_uart_driver##_raw_uart, dev, &__raw_uart_driver); \
+    err = generic_raw_uart_remove(__raw_uart_driver##_raw_uart); \
     if (err)                                                                              \
     {                                                                                     \
       dev_err(dev, "failed to remove generic_raw_uart module");                           \

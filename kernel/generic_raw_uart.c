@@ -1,5 +1,5 @@
 /*-----------------------------------------------------------------------------
- * Copyright (c) 2022 by Alexander Reinert
+ * Copyright (c) 2023 by Alexander Reinert
  * Author: Alexander Reinert
  * Uses parts of bcm2835_raw_uart.c. (c) 2015 by eQ-3 Entwicklung GmbH
  *
@@ -77,6 +77,7 @@ struct generic_raw_uart_instance
   wait_queue_head_t writeq;                  /*wait queue for write operations*/
   struct circ_buf rxbuf;                     /*RX buffer*/
   int open_count;                            /*number of open connections*/
+  bool connection_state;
   struct per_connection_data *tx_connection; /*connection which is currently sending*/
   struct termios termios;                    /*dummy termios for emulating ttyp ioctls*/
 
@@ -97,6 +98,13 @@ struct generic_raw_uart_instance
   dev_t devid;
   struct cdev cdev;
   struct device *dev;
+  struct device *parent;
+
+  bool dump_traffic;
+  unsigned char dump_tx_prefix[32];
+  int dump_rxbuf_pos;
+  unsigned char dump_rxbuf[32];
+  unsigned char dump_rx_prefix[32];
 
   struct generic_raw_uart raw_uart;
 };
@@ -128,7 +136,7 @@ static int generic_raw_uart_get_device_type(struct generic_raw_uart_instance *in
 {
   if (instance->driver->get_device_type == 0)
   {
-    return snprintf(buf, MAX_DEVICE_TYPE_LEN, "GPIO@%s", dev_name(instance->dev->parent));
+    return snprintf(buf, MAX_DEVICE_TYPE_LEN, "GPIO@%s", dev_name(instance->parent));
   }
   else
   {
@@ -290,7 +298,6 @@ static int generic_raw_uart_reset_radio_module(struct generic_raw_uart_instance 
 
   if (instance->open_count > max_open_count)
   {
-    up(&instance->sem);
     ret = -EBUSY;
     goto exit_sem;
   }
@@ -324,7 +331,7 @@ exit_sem:
   up(&instance->sem);
 
 exit:
-  return 0;
+  return ret;
 }
 
 static int generic_raw_uart_open(struct inode *inode, struct file *filep)
@@ -358,6 +365,16 @@ static int generic_raw_uart_open(struct inode *inode, struct file *filep)
     up(&instance->sem);
 
     return -EMFILE;
+  }
+
+  if (!instance->connection_state)
+  {
+    dev_err(instance->dev, "generic_raw_uart_open(): Tried to open disconnected device.");
+
+    /*Release semaphore*/
+    up(&instance->sem);
+
+    return -ENODEV;
   }
 
   if (!instance->open_count) /*Enable HW for the first connection.*/
@@ -690,6 +707,16 @@ void generic_raw_uart_handle_rx_char(struct generic_raw_uart *raw_uart, enum gen
       instance->count_overrun++;
     }
 
+    if (instance->dump_traffic)
+    {
+      instance->dump_rxbuf[instance->dump_rxbuf_pos++] = data;
+      if (instance->dump_rxbuf_pos == sizeof(instance->dump_rxbuf))
+      {
+        print_hex_dump(KERN_INFO, instance->dump_rx_prefix, DUMP_PREFIX_NONE, 32, 1, instance->dump_rxbuf, sizeof(instance->dump_rxbuf), false);
+        instance->dump_rxbuf_pos = 0;
+      }
+    }
+
     if (CIRC_SPACE(instance->rxbuf.head, instance->rxbuf.tail, CIRCBUF_SIZE))
     {
       instance->rxbuf.buf[instance->rxbuf.head] = data;
@@ -711,6 +738,13 @@ EXPORT_SYMBOL(generic_raw_uart_handle_rx_char);
 void generic_raw_uart_rx_completed(struct generic_raw_uart *raw_uart)
 {
   struct generic_raw_uart_instance *instance = raw_uart->private;
+
+  if (instance->dump_traffic)
+  {
+    print_hex_dump(KERN_INFO, instance->dump_rx_prefix, DUMP_PREFIX_NONE, 32, 1, instance->dump_rxbuf, instance->dump_rxbuf_pos, false);
+    instance->dump_rxbuf_pos = 0;
+  }
+
   wake_up_interruptible(&instance->readq);
 }
 EXPORT_SYMBOL(generic_raw_uart_rx_completed);
@@ -734,6 +768,10 @@ static inline void generic_raw_uart_tx_queued_unlocked(struct generic_raw_uart_i
          (instance->tx_connection != NULL) && (instance->tx_connection->tx_buf_index < instance->tx_connection->tx_buf_length))
   {
     bulksize = min(instance->driver->tx_bulktransfer_size, (int)(instance->tx_connection->tx_buf_length - instance->tx_connection->tx_buf_index));
+
+    if (instance->dump_traffic)
+      print_hex_dump(KERN_INFO, instance->dump_tx_prefix, DUMP_PREFIX_NONE, 32, 1, &instance->tx_connection->txbuf[instance->tx_connection->tx_buf_index], bulksize, false);
+
     instance->driver->tx_chars(&instance->raw_uart, instance->tx_connection->txbuf, instance->tx_connection->tx_buf_index, bulksize);
     instance->tx_connection->tx_buf_index += bulksize;
     smp_wmb();
@@ -773,65 +811,50 @@ static int generic_raw_uart_proc_show(struct seq_file *m, void *v)
 
 static int generic_raw_uart_proc_open(struct inode *inode, struct file *file)
 {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0))
+  struct generic_raw_uart_instance *instance = pde_data(inode);
+#else
   struct generic_raw_uart_instance *instance = PDE_DATA(inode);
+#endif
+
   return single_open(file, generic_raw_uart_proc_show, instance);
 }
 #endif /*PROC_DEBUG*/
 
-const char *generic_raw_uart_get_pin_label(enum generic_raw_uart_pin pin)
-{
-  switch (pin)
-  {
-  case GENERIC_RAW_UART_PIN_BLUE:
-    return "pivccu,blue_pin";
-  case GENERIC_RAW_UART_PIN_GREEN:
-    return "pivccu,green_pin";
-  case GENERIC_RAW_UART_PIN_RED:
-    return "pivccu,red_pin";
-  case GENERIC_RAW_UART_PIN_RESET:
-    return "pivccu,reset_pin";
-  case GENERIC_RAW_UART_PIN_ALT_RESET:
-    return "pivccu,alt_reset_pin";
-  }
-  return 0;
-}
-
-int generic_raw_uart_get_gpio_pin_number(struct generic_raw_uart_instance *instance, struct device *dev, enum generic_raw_uart_pin pin)
+int generic_raw_uart_get_gpio_index(struct device *dev, char *con_id, unsigned int idx)
 {
   int res;
+  struct gpio_desc *gpiod = gpiod_get_index(dev, con_id, idx, GPIOD_ASIS);
 
-  if (instance->driver->get_gpio_pin_number == 0)
+  if (IS_ERR_OR_NULL(gpiod))
+    return 0;
+
+  res = desc_to_gpio(gpiod);
+
+  gpiod_put(gpiod);
+
+  return res;
+}
+
+int generic_raw_uart_get_led_gpio_index(struct generic_raw_uart_instance *instance, struct device *dev, enum generic_raw_uart_led led)
+{
+  if (instance->driver->get_led_gpio_index == 0)
   {
-    struct fwnode_handle *fwnode = dev_fwnode(dev);
-    const char *label = generic_raw_uart_get_pin_label(pin);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0))
-    struct gpio_desc *gpiod = fwnode_get_named_gpiod(fwnode, label, 0, GPIOD_ASIS, label);
-#else
-    struct gpio_desc *gpiod = fwnode_get_named_gpiod(fwnode, label);
-#endif
-
-    if (IS_ERR_OR_NULL(gpiod))
-      return 0;
-
-    res = desc_to_gpio(gpiod);
-
-    gpiod_put(gpiod);
-
-    return res;
+    return generic_raw_uart_get_gpio_index(dev, "pivccu,led", led);
   }
   else
   {
-    return instance->driver->get_gpio_pin_number(&instance->raw_uart, pin);
+    return instance->driver->get_led_gpio_index(&instance->raw_uart, led);
   }
 }
 
 static ssize_t reset_radio_module_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
   struct generic_raw_uart_instance *instance = dev_get_drvdata(dev);
-  char *endp;
+  bool val;
   int ret;
 
-  if (simple_strtol(strim((char *)buf), &endp, 0) == 1)
+  if (!kstrtobool(strim((char *)buf), &val) && val)
   {
     ret = generic_raw_uart_reset_radio_module(instance, 0);
     return ret == 0 ? count : ret;
@@ -875,10 +898,47 @@ static ssize_t device_type_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(device_type);
 
+static ssize_t dump_traffic_show(struct device *dev, struct device_attribute *attr, char *page)
+{
+  struct generic_raw_uart_instance *instance = dev_get_drvdata(dev);
+  return sprintf(page, instance->dump_traffic ? "on" : "off");
+}
+static ssize_t dump_traffic_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+  struct generic_raw_uart_instance *instance = dev_get_drvdata(dev);
+  bool val;
+
+  if (!kstrtobool(strim((char *)buf), &val))
+  {
+    instance->dump_traffic = val;
+    dev_info(instance->dev, val ? "Enabled traffic dumping to kernel log" : "Disabled traffic dumping to kernel log");
+    return count;
+  }
+  else
+  {
+    return -EINVAL;
+  }
+}
+static DEVICE_ATTR_RW(dump_traffic);
+
+static ssize_t open_count_show(struct device *dev, struct device_attribute *attr, char *page)
+{
+  struct generic_raw_uart_instance *instance = dev_get_drvdata(dev);
+  return sprintf(page, "%d\n", instance->open_count);
+}
+static DEVICE_ATTR_RO(open_count);
+
+static ssize_t connection_state_show(struct device *dev, struct device_attribute *attr, char *page)
+{
+  struct generic_raw_uart_instance *instance = dev_get_drvdata(dev);
+  return sprintf(page, "%d\n", instance->connection_state);
+}
+static DEVICE_ATTR_RO(connection_state);
 
 static spinlock_t active_devices_lock;
 static bool active_devices[MAX_DEVICES] = {false};
 
+#if defined(CONFIG_OF) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0))
 static int __match_i2c_client_by_address(struct device *dev, void *addrp)
 {
   struct i2c_client *client = i2c_verify_client(dev);
@@ -899,6 +959,7 @@ static struct i2c_client *i2c_find_client(struct i2c_adapter *adapter, int addr)
 
   return NULL;
 }
+#endif
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0))
 static inline bool i2c_client_has_driver(struct i2c_client *client)
@@ -1047,9 +1108,9 @@ struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_u
   }
 
   if (dev_no == 0)
-    instance->dev = device_create(class, dev, instance->devid, NULL, DRIVER_NAME);
+    instance->dev = device_create(class, NULL, instance->devid, NULL, DRIVER_NAME);
   else
-    instance->dev = device_create(class, dev, instance->devid, NULL, DRIVER_NAME "%d", dev_no);
+    instance->dev = device_create(class, NULL, instance->devid, NULL, DRIVER_NAME "%d", dev_no);
 
   if (IS_ERR(instance->dev))
   {
@@ -1059,20 +1120,25 @@ struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_u
 
   dev_set_drvdata(instance->dev, instance);
 
-  instance->reset_pin = generic_raw_uart_get_gpio_pin_number(instance, dev, use_alt_reset_pin ? GENERIC_RAW_UART_PIN_ALT_RESET : GENERIC_RAW_UART_PIN_RESET);
+  instance->parent = dev;
 
-  if (instance->reset_pin != 0)
+  if (instance->driver->reset_radio_module == 0)
   {
-    gpio_request(instance->reset_pin, "pivccu:reset");
-  }
-  else if (instance->driver->reset_radio_module == 0)
-  {
-    dev_info(dev, "No valid reset pin configured");
+    instance->reset_pin = generic_raw_uart_get_gpio_index(dev, "pivccu,reset", use_alt_reset_pin ? 1 : 0);
+
+    if (instance->reset_pin != 0)
+    {
+      gpio_request(instance->reset_pin, "pivccu:reset");
+    }
+    else
+    {
+      dev_info(dev, "No valid reset pin configured");
+    }
   }
 
-  instance->red_pin = generic_raw_uart_get_gpio_pin_number(instance, dev, GENERIC_RAW_UART_PIN_RED);
-  instance->green_pin = generic_raw_uart_get_gpio_pin_number(instance, dev, GENERIC_RAW_UART_PIN_GREEN);
-  instance->blue_pin = generic_raw_uart_get_gpio_pin_number(instance, dev, GENERIC_RAW_UART_PIN_BLUE);
+  instance->red_pin = generic_raw_uart_get_led_gpio_index(instance, dev, GENERIC_RAW_UART_LED_RED);
+  instance->green_pin = generic_raw_uart_get_led_gpio_index(instance, dev, GENERIC_RAW_UART_LED_GREEN);
+  instance->blue_pin = generic_raw_uart_get_led_gpio_index(instance, dev, GENERIC_RAW_UART_LED_BLUE);
 
   err = sysfs_create_file(&instance->dev->kobj, &dev_attr_device_type.attr);
 
@@ -1081,6 +1147,13 @@ struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_u
   err = sysfs_create_file(&instance->dev->kobj, &dev_attr_blue_gpio_pin.attr);
 
   err = sysfs_create_file(&instance->dev->kobj, &dev_attr_reset_radio_module.attr);
+
+  err = sysfs_create_file(&instance->dev->kobj, &dev_attr_dump_traffic.attr);
+  snprintf(instance->dump_tx_prefix, sizeof(instance->dump_tx_prefix), "%s %s: TX: ", dev_driver_string(instance->dev), dev_name(instance->dev));
+  snprintf(instance->dump_rx_prefix, sizeof(instance->dump_rx_prefix), "%s %s: RX: ", dev_driver_string(instance->dev), dev_name(instance->dev));
+
+  err = sysfs_create_file(&instance->dev->kobj, &dev_attr_open_count.attr);
+  err = sysfs_create_file(&instance->dev->kobj, &dev_attr_connection_state.attr);
 
   sema_init(&instance->sem, 1);
   spin_lock_init(&instance->lock_tx);
@@ -1098,6 +1171,8 @@ struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_u
   generic_raw_uart_get_device_type(instance, buf);
   dev_info(instance->dev, "Registered new raw-uart device using underlying device %s.", buf);
 
+  instance->connection_state = true;
+
   return &instance->raw_uart;
 
 failed_device_create:
@@ -1111,10 +1186,23 @@ failed_probe_rtc:
 }
 EXPORT_SYMBOL(generic_raw_uart_probe);
 
-int generic_raw_uart_remove(struct generic_raw_uart *raw_uart, struct device *dev, struct raw_uart_driver *drv)
+int generic_raw_uart_set_connection_state(struct generic_raw_uart *raw_uart, bool state)
+{
+  struct generic_raw_uart_instance *instance = raw_uart->private;
+
+  instance->connection_state = state;
+  sysfs_notify(&instance->dev->kobj, NULL, "connection_state");
+
+  return 0;
+}
+EXPORT_SYMBOL(generic_raw_uart_set_connection_state);
+
+int generic_raw_uart_remove(struct generic_raw_uart *raw_uart)
 {
   struct generic_raw_uart_instance *instance = raw_uart->private;
   unsigned long flags;
+
+  generic_raw_uart_set_connection_state(raw_uart, false);
 
 #ifdef PROC_DEBUG
   remove_proc_entry(dev_name(instance->dev), NULL);
@@ -1127,6 +1215,11 @@ int generic_raw_uart_remove(struct generic_raw_uart *raw_uart, struct device *de
   sysfs_remove_file(&instance->dev->kobj, &dev_attr_blue_gpio_pin.attr);
 
   sysfs_remove_file(&instance->dev->kobj, &dev_attr_reset_radio_module.attr);
+
+  sysfs_remove_file(&instance->dev->kobj, &dev_attr_dump_traffic.attr);
+
+  sysfs_remove_file(&instance->dev->kobj, &dev_attr_open_count.attr);
+  sysfs_remove_file(&instance->dev->kobj, &dev_attr_connection_state.attr);
 
   if (instance->reset_pin != 0)
   {
@@ -1172,11 +1265,9 @@ module_exit(generic_raw_uart_exit);
 
 static int generic_raw_uart_set_dummy_rx8130_loader(const char *val, const struct kernel_param *kp)
 {
-  int load, ret;
+  bool load;
 
-  ret = kstrtoint(val, 10, &load);
-
-  if (load != 1)
+  if (!kstrtobool(val, &load) && !load)
   {
     return -EINVAL;
   }
@@ -1260,7 +1351,7 @@ EXPORT_SYMBOL(generic_raw_uart_verify_dkey);
 
 MODULE_ALIAS("platform:generic-raw-uart");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.22");
+MODULE_VERSION("1.30");
 MODULE_DESCRIPTION("generic raw uart driver for communication of debmatic and piVCCU with the HM-MOD-RPI-PCB and RPI-RF-MOD radio modules");
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 

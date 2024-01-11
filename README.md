@@ -30,7 +30,7 @@ Keeping this project running is very expensive, e.g. I have to buy a lot of diff
 
 ### Prequisites for HM-MOD-RPI-PCB and RPI-RF-MOD on GPIO header
 * Supported Single Board Computer
-  * Raspberry Pi 2B/3B/3B+/4B running Raspberry Pi OS Buster or Bullseye
+  * Raspberry Pi 2B/3B/3B+/4B/5B running Raspberry Pi OS Bullseye or Bookworm
   * Asus Tinkerboard running Armbian with Mainline kernel
   * Asus Tinkerboard S running Armbian with Mainline kernel
   * Banana Pi M1 running Armbian with Mainline kernel (LEDs of RPI-RF-MOD not supported due to incompatible GPIO pin header)
@@ -220,8 +220,8 @@ sudo dpkg-reconfigure pivccu3
 
 ### Build packages by your own
 If you like to build the .deb package by yourself
-* Use Ubuntu 16.04 as build system
-* Install prequisites *__tbd__*
+* Use Debian Bullseye as build system
+* Install prequisites: device-tree-compiler build-essential crossbuild-essential-arm64 crossbuild-essential-armhf crossbuild-essential-i386 fuse2fs fuse
 * Clone source
 * create_*.sh are the scripts to build the deb packages
 * Deploy the .deb files to an apt repository e.g. using reprepro

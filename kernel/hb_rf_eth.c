@@ -1,5 +1,5 @@
 /*-----------------------------------------------------------------------------
- * Copyright (c) 2022 by Alexander Reinert
+ * Copyright (c) 2023 by Alexander Reinert
  * Author: Alexander Reinert
  *
  * This program is free software; you can redistribute it and/or modify
@@ -289,6 +289,7 @@ static int hb_rf_eth_try_connect(char endpointIdentifier)
 
   _sock = sock;
   sysfs_notify(&dev->kobj, NULL, "is_connected");
+  generic_raw_uart_set_connection_state(raw_uart, true);
   return 0;
 }
 
@@ -393,6 +394,7 @@ static int hb_rf_eth_recv_threadproc(void *data)
       sock_release(_sock);
       _sock = NULL;
       sysfs_notify(&dev->kobj, NULL, "is_connected");
+      generic_raw_uart_set_connection_state(raw_uart, false);
 
       if (autoreconnect)
       {
@@ -461,6 +463,7 @@ static int hb_rf_eth_connect(const char *ip)
     sock_release(_sock);
     _sock = NULL;
     sysfs_notify(&dev->kobj, NULL, "is_connected");
+    generic_raw_uart_set_connection_state(raw_uart, false);
     return err;
   }
   else
@@ -476,6 +479,7 @@ static int hb_rf_eth_connect(const char *ip)
       sock_release(_sock);
       _sock = NULL;
       sysfs_notify(&dev->kobj, NULL, "is_connected");
+      generic_raw_uart_set_connection_state(raw_uart, false);
       return err;
     }
   }
@@ -508,6 +512,7 @@ static void hb_rf_eth_disconnect(void)
     sock_release(_sock);
     _sock = NULL;
     sysfs_notify(&dev->kobj, NULL, "is_connected");
+    generic_raw_uart_set_connection_state(raw_uart, false);
   }
 }
 
@@ -592,19 +597,16 @@ static void hb_rf_eth_gpio_set_multiple(struct gpio_chip *gc, unsigned long *mas
   spin_unlock_irqrestore(&gpio_lock, lock_flags);
 }
 
-static int hb_rf_eth_get_gpio_pin_number(struct generic_raw_uart *raw_uart, enum generic_raw_uart_pin pin)
+static int hb_rf_eth_get_led_gpio_index(struct generic_raw_uart *raw_uart, enum generic_raw_uart_led led)
 {
-  switch (pin)
+  switch (led)
   {
-  case GENERIC_RAW_UART_PIN_RED:
+  case GENERIC_RAW_UART_LED_RED:
     return gc.base;
-  case GENERIC_RAW_UART_PIN_GREEN:
+  case GENERIC_RAW_UART_LED_GREEN:
     return gc.base + 1;
-  case GENERIC_RAW_UART_PIN_BLUE:
+  case GENERIC_RAW_UART_LED_BLUE:
     return gc.base + 2;
-  case GENERIC_RAW_UART_PIN_RESET:
-  case GENERIC_RAW_UART_PIN_ALT_RESET:
-    return 0;
   }
   return 0;
 }
@@ -662,7 +664,7 @@ static int hb_rf_eth_get_device_type(struct generic_raw_uart *raw_uart, char *pa
 
 static struct raw_uart_driver hb_rf_eth = {
     .owner = THIS_MODULE,
-    .get_gpio_pin_number = hb_rf_eth_get_gpio_pin_number,
+    .get_led_gpio_index = hb_rf_eth_get_led_gpio_index,
     .reset_radio_module = hb_rf_eth_reset_radio_module,
     .start_connection = hb_rf_eth_start_connection,
     .stop_connection = hb_rf_eth_stop_connection,
@@ -708,6 +710,8 @@ static ssize_t is_connected_show(struct device *dev, struct device_attribute *at
 }
 static DEVICE_ATTR_RO(is_connected);
 
+static const char *hb_rf_eth_gpio_names[3] = { "HB-RF-ETH HM_RED", "HB-RF-ETH HM_GREEN", "HB-RF-ETH HM_BLUE" };
+
 static int __init hb_rf_eth_init(void)
 {
   int err;
@@ -738,6 +742,7 @@ static int __init hb_rf_eth_init(void)
 
   gc.label = "hb-rf-eth-gpio";
   gc.ngpio = 3;
+  gc.names = hb_rf_eth_gpio_names;
   gc.request = hb_rf_eth_gpio_request;
   gc.free = hb_rf_eth_gpio_free;
   gc.get_direction = hb_rf_eth_gpio_direction_get;
@@ -765,8 +770,14 @@ static int __init hb_rf_eth_init(void)
     goto failed_raw_uart_probe;
   }
 
-  sysfs_create_file(&dev->kobj, &dev_attr_is_connected.attr);
-  sysfs_create_file(&dev->kobj, &dev_attr_connect.attr);
+  generic_raw_uart_set_connection_state(raw_uart, false);
+
+  err = sysfs_create_file(&dev->kobj, &dev_attr_is_connected.attr);
+  if (err)
+    dev_info(dev, "failed creating is_connected sysfs file: %d\n", err);
+
+  err = sysfs_create_file(&dev->kobj, &dev_attr_connect.attr);
+    dev_info(dev, "failed creating connect sysfs file: %d\n", err);
 
   return 0;
 
@@ -783,7 +794,7 @@ failed_class_create:
 static void __exit hb_rf_eth_exit(void)
 {
   if (raw_uart)
-    generic_raw_uart_remove(raw_uart, dev, &hb_rf_eth);
+    generic_raw_uart_remove(raw_uart);
 
   sysfs_remove_file(&dev->kobj, &dev_attr_is_connected.attr);
   sysfs_remove_file(&dev->kobj, &dev_attr_connect.attr);
@@ -826,5 +837,5 @@ module_exit(hb_rf_eth_exit);
 
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 MODULE_DESCRIPTION("HB-RF-ETH raw uart driver");
-MODULE_VERSION("1.18");
+MODULE_VERSION("1.22");
 MODULE_LICENSE("GPL");
